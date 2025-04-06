@@ -1,5 +1,5 @@
 """
-Simplified CLI Chat Client for the MCP Server/Client application.
+Simplified CLI Chat Client for the MCP Server/Client application with .env support.
 
 This module provides a command-line interface for interacting with the local MCP Server
 implementation without relying on external mcp-server package.
@@ -12,6 +12,15 @@ import logging
 import subprocess
 import sys
 from typing import Dict, Any, List, Optional
+
+# Load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+    print("Loaded environment variables from .env file")
+except ImportError:
+    print("python-dotenv not installed, environment variables from .env file will not be loaded")
+    print("To install: uv add python-dotenv")
 
 # Try to import rich for enhanced console output
 try:
@@ -35,15 +44,6 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
-
-# Load environment variables from .env file
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-    logger.info("Loaded environment variables from .env file")
-except ImportError:
-    logger.warning("python-dotenv not installed, environment variables from .env file will not be loaded")
-    logger.warning("To install: uv add python-dotenv")
 
 # Initialize Rich console if available
 if RICH_AVAILABLE:
@@ -75,7 +75,8 @@ class SimpleMCPClient:
                 [sys.executable, self.server_script],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True
+                text=True,
+                env=os.environ.copy()  # Pass current environment variables including those from .env
             )
             logger.info(f"Started MCP Server with PID {self.server_process.pid}")
             
@@ -265,12 +266,13 @@ class SimpleMCPChatClient:
             model: The model to use for the chat (if using Ollama)
         """
         self.server_script = server_script
+        # Use model from arguments, environment variable, or default
         self.model = model or os.getenv("OLLAMA_MODEL_NAME", "llama3.2:1b")
         self.messages = []
-        self.system_prompt = """You are a helpful assistant with access to various tools.
+        self.system_prompt = os.getenv("SYSTEM_PROMPT", """You are a helpful assistant with access to various tools.
         You can use these tools to help the user with their questions and tasks.
         Always use the appropriate tool when needed, and explain your reasoning.
-        """
+        """)
         
         # Create the MCP client
         self.mcp_client = SimpleMCPClient(server_script)
