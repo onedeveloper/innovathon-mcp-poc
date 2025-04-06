@@ -10,9 +10,9 @@ import calendar
 import pytz
 from typing import Dict, Any, Optional, List
 import logging
-from ..core.agent_plugin import AgentPlugin
-from ..core.registry import AgentRegistry
-from ..core.tool_schema import ToolSchemaHandler
+from core.agent_plugin import AgentPlugin
+from core.registry import AgentRegistry
+from core.tool_schema import ToolSchemaHandler
 
 # Set up logging
 logger = logging.getLogger(__name__)
