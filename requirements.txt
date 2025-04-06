@@ -1,0 +1,21 @@
+"""
+Requirements file for the MCP Server/Client application.
+
+This file lists all the dependencies required to run the application.
+"""
+# Core dependencies
+mcp-server>=0.1.0
+jsonschema>=4.17.3
+
+# Time-related dependencies
+pytz>=2023.3
+
+# CLI Chat Client dependencies
+rich>=13.3.5
+ollama>=0.1.5
+
+# Optional: Development dependencies
+# pytest>=7.3.1
+# black>=23.3.0
+# isort>=5.12.0
+
