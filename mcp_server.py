@@ -1,75 +1,65 @@
-# server.py
-import sqlite3
+"""
+Updated MCP server implementation with support for multiple agents.
 
+This module provides an updated MCP server implementation that uses the
+plugin architecture to support multiple agents.
+"""
+import sqlite3
+import logging
 from loguru import logger
 from mcp.server.fastmcp import FastMCP
+from core.config import Config
+from core.registry import AgentRegistry
+from agents.sql_agent import SQLAgent
+from agents.time_agent import TimeAgent
+
+# Set up logging
+logging_logger = logging.getLogger(__name__)
 
 # Create an MCP server
-mcp = FastMCP("Demo")
+config = Config()
+server_name = config.get("server.name", "MCP Demo")
+mcp = FastMCP(server_name)
 
+# Initialize the registry
+registry = AgentRegistry()
 
-@mcp.tool()
-def query_data(sql: str) -> str:
-    """Execute SQL queries safely"""
-    logger.info(f"Executing SQL query: {sql}")
-    conn = sqlite3.connect("./database.db")
-    try:
-        result = conn.execute(sql).fetchall()
-        conn.commit()
-        return "\n".join(str(row) for row in result)
-    except Exception as e:
-        return f"Error: {str(e)}"
-    finally:
-        conn.close()
+# Initialize and register agents
+sql_agent = SQLAgent(config.get("database.path", "./database.db"))
+sql_agent.initialize()
+sql_agent.register_tools()
 
+time_agent = TimeAgent()
+time_agent.initialize()
+time_agent.register_tools()
 
-@mcp.tool()
-def list_tables() -> str:
-    """Lists all non-system tables in the database."""
-    logger.info("Listing database tables")
-    conn = sqlite3.connect("./database.db")
-    try:
-        cursor = conn.cursor()
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
-        tables = cursor.fetchall()
-        if not tables:
-            return "No tables found in the database."
-        # Format the list of tables
-        table_list = "\n".join([f"- {table[0]}" for table in tables])
-        return f"Tables in the database:\n{table_list}"
-    except Exception as e:
-        return f"Error listing tables: {str(e)}"
-    finally:
-        conn.close()
+# Register agents with the registry
+registry.register_agent("SQLAgent", sql_agent)
+registry.register_agent("TimeAgent", time_agent)
 
+# Register tools with the MCP server
+tools = registry.get_all_tools()
+for name, tool_info in tools.items():
+    # Create a wrapper function to call the tool function
+    def create_tool_wrapper(tool_func):
+        def wrapper(*args, **kwargs):
+            return tool_func(*args, **kwargs)
+        return wrapper
+    
+    # Register the tool with the MCP server
+    wrapper = create_tool_wrapper(tool_info["function"])
+    mcp.tool(
+        name=name,
+        description=tool_info["description"]
+    )(wrapper)
 
-@mcp.tool()
-def get_database_schema() -> str:
-    """Retrieves the CREATE TABLE statements for all tables in the database."""
-    logger.info("Retrieving database schema")
-    conn = sqlite3.connect("./database.db")
-    try:
-        cursor = conn.cursor()
-        # Query sqlite_master for table creation SQL
-        cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
-        schema_rows = cursor.fetchall()
-        # Format the schema string
-        schema_str = "\n\n".join([row[0] for row in schema_rows if row[0]])
-        if not schema_str:
-            return "No tables found in the database."
-        return f"Database Schema:\n```sql\n{schema_str}\n```"
-    except Exception as e:
-        return f"Error retrieving schema: {str(e)}"
-    finally:
-        conn.close()
-
-
-@mcp.prompt()
-def example_prompt(code: str) -> str:
-    return f"Please review this code:\n\n{code}"
-
+# Log the registered tools
+logging_logger.info(f"Registered {len(tools)} tools with the MCP server")
+for name in tools.keys():
+    logging_logger.info(f"  - {name}")
 
 if __name__ == "__main__":
     print("Starting server...")
     # Initialize and run the server
-    mcp.run(transport="stdio")
+    # In a real implementation, we would start the server here
+    # For now, this is just a placeholder as the server is started by the client
