@@ -10,6 +10,7 @@ from loguru import logger
 from mcp.server.fastmcp import FastMCP
 from core.config import Config
 from core.registry import AgentRegistry
+from core.tool_schema import ToolSchemaHandler
 from agents.sql_agent import SQLAgent
 from agents.time_agent import TimeAgent
 
@@ -50,7 +51,8 @@ for name, tool_info in tools.items():
     wrapper = create_tool_wrapper(tool_info["function"])
     mcp.tool(
         name=name,
-        description=tool_info["description"]
+        description=tool_info["description"],
+        input_schema=tool_info["schema"]  # Fixed: Now properly passing the schema
     )(wrapper)
 
 # Log the registered tools

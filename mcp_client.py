@@ -9,13 +9,14 @@ import ollama # Replaced anthropic with ollama
 from dotenv import load_dotenv
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from core.tool_handler import ToolCallHandler
 
 load_dotenv()
 
 
 # Initialize Ollama client
 # Assuming Ollama server is running locally at default address http://localhost:11434
-ollama_client = ollama.AsyncClient()
+ollama_client = ollama.AsyncClient() 
 
 
 # Create server parameters for stdio connection
@@ -90,109 +91,51 @@ class Chat:
 
             # --- Tool Call Handling ---
             tool_executed = False
-
-            # Option 1: Check structured tool_calls field (Standard way)
+            
+            # Use the standardized ToolCallHandler to parse tool calls
             if assistant_message.get('tool_calls'):
-                print("--- Handling structured tool_calls ---")
-                tool_executed = True # Mark that we are handling a tool call
+                print("--- Handling tool calls ---")
+                tool_executed = True
                 for tool_call in assistant_message['tool_calls']:
-                    tool_name = tool_call['function']['name']
-                    # Handle arguments which might be a string (needs parsing) or already a dict
-                    raw_args = tool_call['function']['arguments']
-                    if isinstance(raw_args, str):
-                        try:
-                            tool_args = json.loads(raw_args)
-                        except json.JSONDecodeError:
-                            print(f"--- Warning: Failed to parse string arguments: {raw_args} ---")
-                            # Decide how to handle - skip tool call? Pass raw string?
-                            # For now, let's skip the tool call if args are unparsable string
-                            continue # Skip to next tool_call or end of loop
-                    elif isinstance(raw_args, dict):
-                        tool_args = raw_args # Use the dictionary directly
-                    else:
-                        print(f"--- Warning: Unexpected argument type: {type(raw_args)} ---")
-                        continue # Skip this tool call
-
+                    tool_name, tool_args, error = ToolCallHandler.parse_tool_call(tool_call)
+                    
+                    if error:
+                        print(f"--- Error parsing tool call: {error} ---")
+                        continue
+                        
+                    if not tool_name:
+                        print("--- Warning: No tool name found in tool call ---")
+                        continue
+                        
                     print(f"--- Calling tool: {tool_name} with args: {tool_args} ---")
                     mcp_tool_result = await session.call_tool(tool_name, cast(dict, tool_args))
                     tool_result_content = getattr(mcp_tool_result.content[0], "text", "")
                     print(f"--- Tool result: {tool_result_content} ---")
-
-                    # Append tool result with more context for the model
-                    formatted_tool_result = f"Tool execution result for {tool_name}: {tool_result_content}"
-                    self.messages.append({
-                        "role": "tool",
-                        "content": formatted_tool_result,
-                        # "tool_call_id": tool_call.get('id')
-                    })
-
-            # Option 2: Check for <toolcall> tag in content (Workaround for specific model output)
+                    
+                    # Format the tool result using the standardized handler
+                    formatted_result = ToolCallHandler.format_tool_result(tool_name, tool_result_content)
+                    self.messages.append(formatted_result)
+            
+            # Check for <toolcall> tag in content
             elif assistant_message.get('content') and '<toolcall>' in assistant_message['content']:
                 print("--- Handling <toolcall> tag in content ---")
-                tool_executed = True # Mark that we are handling a tool call
                 content_str = assistant_message['content']
-                try:
-                    # Extract JSON string between tags
-                    start_tag = '<toolcall>'
-                    end_tag = '</toolcall>'
-                    start_index = content_str.find(start_tag) + len(start_tag)
-                    end_index = content_str.find(end_tag)
-                    tool_call_json_str = content_str[start_index:end_index].strip()
-
-                    # Parse the JSON
-                    tool_call_data = json.loads(tool_call_json_str)
-
-                    # --- More Refined Tool Name and Argument Extraction from <toolcall> ---
-                    tool_name = None
-                    tool_args = {} # Default to empty args
-
-                    if tool_call_data.get("type") == "function" and "arguments" in tool_call_data:
-                        arguments_dict = tool_call_data["arguments"]
-                        if isinstance(arguments_dict, dict):
-                            # Case 1: Arguments contain {'name': 'tool_name'} for parameterless tools
-                            potential_tool_name = arguments_dict.get("name")
-                            if potential_tool_name in ["list_tables", "get_database_schema"]:
-                                tool_name = potential_tool_name
-                                tool_args = {} # Ensure args are empty for these
-                            # Case 2: Arguments contain {'sql': '...'} for query_data
-                            elif "sql" in arguments_dict:
-                                tool_name = "query_data"
-                                tool_args = arguments_dict # Pass the whole dict containing 'sql'
-                            else:
-                                raise ValueError(f"Unrecognized arguments structure in <toolcall>: {arguments_dict}")
-                        else:
-                            # Handle case where arguments might be a simple string (e.g., just the SQL for query_data)
-                            # This is less likely based on current observations but good to consider
-                            # if isinstance(arguments_dict, str) and is_likely_sql(arguments_dict):
-                            #    tool_name = "query_data"
-                            #    tool_args = {"sql": arguments_dict}
-                            # else:
-                            raise ValueError("Arguments field in <toolcall> JSON is not a dictionary or recognized string format")
-                    else:
-                        raise ValueError("Unexpected JSON structure in <toolcall>")
-
-                    # Ensure tool_name was determined
-                    if not tool_name:
-                        raise ValueError("Could not determine tool name from <toolcall> tag")
-
-
+                
+                # Use the standardized ToolCallHandler to parse tool calls
+                tool_name, tool_args, error = ToolCallHandler.parse_tool_call(content_str)
+                
+                if error:
+                    print(f"--- Error parsing <toolcall> tag: {error} ---")
+                else:
+                    tool_executed = True
                     print(f"--- Calling tool (from tag): {tool_name} with args: {tool_args} ---")
-                    # Pass the extracted dictionary directly
                     mcp_tool_result = await session.call_tool(tool_name, cast(dict, tool_args))
                     tool_result_content = getattr(mcp_tool_result.content[0], "text", "")
                     print(f"--- Tool result: {tool_result_content} ---")
-
-                    # Append tool result with more context for the model (for tag parsing path)
-                    formatted_tool_result = f"Tool execution result for {tool_name}: {tool_result_content}"
-                    self.messages.append({
-                        "role": "tool",
-                        "content": formatted_tool_result, # Use the formatted string
-                    })
-                except Exception as parse_error:
-                    print(f"--- Error parsing <toolcall> tag: {parse_error} ---")
-                    # Append an error message as tool result? Or just proceed without tool call?
-                    # For now, just print error and don't make the second call
-                    tool_executed = False # Reset flag as tool call failed
+                    
+                    # Format the tool result using the standardized handler
+                    formatted_result = ToolCallHandler.format_tool_result(tool_name, tool_result_content)
+                    self.messages.append(formatted_result)
 
             # --- Follow-up Call or Final Response ---
             if tool_executed:
@@ -241,5 +184,3 @@ class Chat:
 
 
 chat = Chat()
-
-asyncio.run(chat.run())
