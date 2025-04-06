@@ -41,7 +41,7 @@ def initialize_database():
     if not os.path.exists("database.db"):
         conn = sqlite3.connect("database.db")
         cursor = conn.cursor()
-        
+
         # Create sample tables
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
@@ -51,7 +51,7 @@ def initialize_database():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         ''')
-        
+
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY,
@@ -60,7 +60,7 @@ def initialize_database():
             stock INTEGER DEFAULT 0
         )
         ''')
-        
+
         # Insert sample data
         cursor.executemany('''
         INSERT INTO users (name, email) VALUES (?, ?)
@@ -69,7 +69,7 @@ def initialize_database():
             ('Jane Smith', 'jane@example.com'),
             ('Bob Johnson', 'bob@example.com'),
         ])
-        
+
         cursor.executemany('''
         INSERT INTO products (name, price, stock) VALUES (?, ?, ?)
         ''', [
@@ -78,7 +78,7 @@ def initialize_database():
             ('Headphones', 149.99, 30),
             ('Monitor', 299.99, 15),
         ])
-        
+
         conn.commit()
         conn.close()
         print("Created sample database with users and products tables")
@@ -103,25 +103,25 @@ class ChatProcessor:
         6.  Always explain the results of your query, the schema, or the table list clearly.
         7.  If a `query_data` call fails, explain the error using the schema information (if available) and suggest a valid query or the use of `get_database_schema`.
         """
-        
+
         # Start the MCP server and processing thread
         self.start_backend()
-    
+
     def start_backend(self):
         """Start the backend processing thread that handles MCP communication"""
         threading.Thread(target=self._start_mcp_server, daemon=True).start()
-    
+
     def _start_mcp_server(self):
         """Initialize and run the MCP server connection"""
         asyncio.run(self._run_server())
-    
+
     async def _run_server(self):
         """Run the MCP server and initialize the connection"""
         async with stdio_client(server_params) as (read, write):
             async with ClientSession(read, write) as session:
                 # Initialize the connection
                 await session.initialize()
-                
+
                 # Process messages from the queue
                 while True:
                     try:
@@ -132,10 +132,10 @@ class ChatProcessor:
                             response_callback(result)
                     except Exception as e:
                         print(f"Error processing message: {str(e)}")
-                        
+
                     # Short sleep to prevent CPU hogging
                     await asyncio.sleep(0.1)
-    
+
     async def _process_query(self, session: ClientSession, query: str) -> List[str]:
         """Process a query using Ollama and return the response messages"""
         # Get available tools from MCP server
@@ -162,7 +162,7 @@ class ChatProcessor:
 
         # All Ollama responses will be collected here
         all_responses = []
-        
+
         # Specify the Ollama model to use (e.g., llama3, change if needed)
         # Read model name from environment variable, default if not set
         model_name = os.getenv("OLLAMA_MODEL_NAME", "llama3.2:1b") # Updated default model
@@ -189,11 +189,31 @@ class ChatProcessor:
                 tool_executed = True
                 for tool_call in assistant_message['tool_calls']:
                     tool_name = tool_call['function']['name']
-                    try:
-                        tool_args = json.loads(tool_call['function']['arguments'])
-                    except json.JSONDecodeError:
-                        tool_args = tool_call['function']['arguments']
-                    
+                    # Handle arguments which might be a string (needs parsing) or already a dict
+                    raw_args = tool_call['function']['arguments']
+                    if isinstance(raw_args, str):
+                        try:
+                            tool_args = json.loads(raw_args)
+                        except json.JSONDecodeError:
+                            print(f"--- Warning: Failed to parse string arguments: {raw_args} ---")
+                            # Decide how to handle - skip tool call? Pass raw string?
+                            # For now, let's skip the tool call if args are unparsable string
+                            tool_executed = False # Mark as failed for this specific call
+                            final_content_to_return = f"Failed to parse tool arguments: {raw_args}"
+                            break # Exit the loop over tool_calls as one failed
+                    elif isinstance(raw_args, dict):
+                        tool_args = raw_args # Use the dictionary directly
+                    else:
+                        print(f"--- Warning: Unexpected argument type: {type(raw_args)} ---")
+                        tool_executed = False # Mark as failed for this specific call
+                        final_content_to_return = f"Unexpected tool argument type: {type(raw_args)}"
+                        break # Exit the loop over tool_calls as one failed
+
+                    # If parsing failed and we set final_content_to_return, skip execution for this call
+                    if not tool_executed:
+                        break
+
+
                     print(f"Calling tool: {tool_name} with args: {tool_args}")
                     mcp_tool_result = await session.call_tool(tool_name, cast(dict, tool_args))
                     tool_result_content = getattr(mcp_tool_result.content[0], "text", "")
@@ -219,18 +239,40 @@ class ChatProcessor:
                     end_index = content_str.find(end_tag)
                     tool_call_json_str = content_str[start_index:end_index].strip()
                     tool_call_data = json.loads(tool_call_json_str)
-                    
-                    # Extract tool name and args
+
+                    # --- More Refined Tool Name and Argument Extraction from <toolcall> ---
+                    tool_name = None
+                    tool_args = {} # Default to empty args
+
                     if tool_call_data.get("type") == "function" and "arguments" in tool_call_data:
-                        # Assume the tool is 'query_data' based on context
-                        tool_name = "query_data"
-                        # The 'arguments' field itself should be the dictionary of args
-                        tool_args = tool_call_data["arguments"]
-                        if not isinstance(tool_args, dict):
-                            # Ensure tool_args is actually a dictionary
-                            raise ValueError("Arguments field in <toolcall> JSON is not a dictionary")
+                        arguments_dict = tool_call_data["arguments"]
+                        if isinstance(arguments_dict, dict):
+                            # Case 1: Arguments contain {'name': 'tool_name'} for parameterless tools
+                            potential_tool_name = arguments_dict.get("name")
+                            if potential_tool_name in ["list_tables", "get_database_schema"]:
+                                tool_name = potential_tool_name
+                                tool_args = {} # Ensure args are empty for these
+                            # Case 2: Arguments contain {'sql': '...'} for query_data
+                            elif "sql" in arguments_dict:
+                                tool_name = "query_data"
+                                tool_args = arguments_dict # Pass the whole dict containing 'sql'
+                            else:
+                                raise ValueError(f"Unrecognized arguments structure in <toolcall>: {arguments_dict}")
+                        else:
+                            # Handle case where arguments might be a simple string (e.g., just the SQL for query_data)
+                            # This is less likely based on current observations but good to consider
+                            # if isinstance(arguments_dict, str) and is_likely_sql(arguments_dict):
+                            #    tool_name = "query_data"
+                            #    tool_args = {"sql": arguments_dict}
+                            # else:
+                            raise ValueError("Arguments field in <toolcall> JSON is not a dictionary or recognized string format")
                     else:
-                         raise ValueError("Unexpected JSON structure in <toolcall>")
+                        raise ValueError("Unexpected JSON structure in <toolcall>")
+
+                    # Ensure tool_name was determined
+                    if not tool_name:
+                        raise ValueError("Could not determine tool name from <toolcall> tag")
+
 
                     print(f"--- Calling tool (from tag): {tool_name} with args: {tool_args} ---")
                     # Pass the extracted dictionary directly
@@ -261,7 +303,7 @@ class ChatProcessor:
                 self.messages.append(final_assistant_message)
                 if final_assistant_message.get('content'):
                     final_content_to_return = final_assistant_message['content']
-            
+
             # If no tool call was attempted/parsed, use the original response content
             elif assistant_message.get('content'):
                  final_content_to_return = assistant_message['content']
@@ -287,55 +329,55 @@ def submit_query(query: str, chat_history: list) -> tuple[list, list]:
     """Submit a query to the chat processor and update the chat history"""
     if not query.strip():
         return chat_history, chat_history
-    
+
     # Add user message to history immediately
     chat_history.append((query, None))
-    
+
     # Create a result container
     result_container = []
-    
+
     # Define callback for when the result is ready
     def on_result(responses):
         combined_response = "\n\n".join(responses)
         result_container.append(combined_response)
-    
+
     # Submit the query to the processor
     message_queue.put((query, on_result))
-    
+
     # Wait for the result
     while not result_container:
         time.sleep(0.1)
-    
+
     # Update the last history entry with the response
     chat_history[-1] = (query, result_container[0])
-    
+
     return chat_history, chat_history
 
 def main():
     # Initialize the database with sample data if needed
     initialize_database()
-    
+
     # Initialize the chat processor
     chat_processor = ChatProcessor()
-    
+
     # Create the Gradio interface
     with gr.Blocks(title="AI SQL Assistant", theme=gr.themes.Soft(), css="footer {visibility: hidden}") as demo:
         gr.Markdown("# AI SQL Assistant")
-        gr.Markdown("""This application allows you to interact with a SQLite database using natural language. 
+        gr.Markdown("""This application allows you to interact with a SQLite database using natural language.
         Ask questions about the data or request SQL operations, and the AI will generate and execute the appropriate SQL queries.
-        
+
         **Sample tables in the database:**
         - `users` (id, name, email, created_at)
         - `products` (id, name, price, stock)
         """)
-        
+
         chatbot = gr.Chatbot(
-            label="Chat", 
+            label="Chat",
             height=500,
             bubble_full_width=False,
             show_copy_button=True
         )
-        
+
         with gr.Row():
             msg = gr.Textbox(
                 label="Ask a question or request a SQL operation",
@@ -343,7 +385,7 @@ def main():
                 scale=9
             )
             submit = gr.Button("Submit", scale=1)
-        
+
         with gr.Accordion("Example Queries", open=False):
             example_queries = [
                 "List all tables in the database",
@@ -357,7 +399,7 @@ def main():
                 examples=example_queries,
                 inputs=msg
             )
-        
+
         # Set up event handlers
         submit.click(submit_query, [msg, chatbot], [chatbot, chatbot]).then(
             lambda: "", None, [msg]  # Clear the input box after submission
@@ -365,7 +407,7 @@ def main():
         msg.submit(submit_query, [msg, chatbot], [chatbot, chatbot]).then(
             lambda: "", None, [msg]  # Clear the input box after submission
         )
-        
+
     # Launch the interface
     demo.launch(share=False, server_port=7860)
 

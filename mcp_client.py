@@ -68,7 +68,7 @@ class Chat:
         # Add system prompt if messages list is empty
         if not self.messages:
              self.messages.append({"role": "system", "content": self.system_prompt})
-        
+
         # Add the user message (already added in chat_loop, so no need here)
         # self.messages.append({"role": "user", "content": query}) # Already added in chat_loop
 
@@ -90,18 +90,29 @@ class Chat:
 
             # --- Tool Call Handling ---
             tool_executed = False
-            
+
             # Option 1: Check structured tool_calls field (Standard way)
             if assistant_message.get('tool_calls'):
                 print("--- Handling structured tool_calls ---")
                 tool_executed = True # Mark that we are handling a tool call
                 for tool_call in assistant_message['tool_calls']:
                     tool_name = tool_call['function']['name']
-                    try:
-                        tool_args = json.loads(tool_call['function']['arguments'])
-                    except json.JSONDecodeError:
-                        tool_args = tool_call['function']['arguments']
-                    
+                    # Handle arguments which might be a string (needs parsing) or already a dict
+                    raw_args = tool_call['function']['arguments']
+                    if isinstance(raw_args, str):
+                        try:
+                            tool_args = json.loads(raw_args)
+                        except json.JSONDecodeError:
+                            print(f"--- Warning: Failed to parse string arguments: {raw_args} ---")
+                            # Decide how to handle - skip tool call? Pass raw string?
+                            # For now, let's skip the tool call if args are unparsable string
+                            continue # Skip to next tool_call or end of loop
+                    elif isinstance(raw_args, dict):
+                        tool_args = raw_args # Use the dictionary directly
+                    else:
+                        print(f"--- Warning: Unexpected argument type: {type(raw_args)} ---")
+                        continue # Skip this tool call
+
                     print(f"--- Calling tool: {tool_name} with args: {tool_args} ---")
                     mcp_tool_result = await session.call_tool(tool_name, cast(dict, tool_args))
                     tool_result_content = getattr(mcp_tool_result.content[0], "text", "")
@@ -127,21 +138,43 @@ class Chat:
                     start_index = content_str.find(start_tag) + len(start_tag)
                     end_index = content_str.find(end_tag)
                     tool_call_json_str = content_str[start_index:end_index].strip()
-                    
+
                     # Parse the JSON
                     tool_call_data = json.loads(tool_call_json_str)
-                    
-                    # Extract tool name and args
+
+                    # --- More Refined Tool Name and Argument Extraction from <toolcall> ---
+                    tool_name = None
+                    tool_args = {} # Default to empty args
+
                     if tool_call_data.get("type") == "function" and "arguments" in tool_call_data:
-                        # Assume the tool is 'query_data' based on context
-                        tool_name = "query_data"
-                        # The 'arguments' field itself should be the dictionary of args
-                        tool_args = tool_call_data["arguments"]
-                        if not isinstance(tool_args, dict):
-                            # Ensure tool_args is actually a dictionary
-                            raise ValueError("Arguments field in <toolcall> JSON is not a dictionary")
+                        arguments_dict = tool_call_data["arguments"]
+                        if isinstance(arguments_dict, dict):
+                            # Case 1: Arguments contain {'name': 'tool_name'} for parameterless tools
+                            potential_tool_name = arguments_dict.get("name")
+                            if potential_tool_name in ["list_tables", "get_database_schema"]:
+                                tool_name = potential_tool_name
+                                tool_args = {} # Ensure args are empty for these
+                            # Case 2: Arguments contain {'sql': '...'} for query_data
+                            elif "sql" in arguments_dict:
+                                tool_name = "query_data"
+                                tool_args = arguments_dict # Pass the whole dict containing 'sql'
+                            else:
+                                raise ValueError(f"Unrecognized arguments structure in <toolcall>: {arguments_dict}")
+                        else:
+                            # Handle case where arguments might be a simple string (e.g., just the SQL for query_data)
+                            # This is less likely based on current observations but good to consider
+                            # if isinstance(arguments_dict, str) and is_likely_sql(arguments_dict):
+                            #    tool_name = "query_data"
+                            #    tool_args = {"sql": arguments_dict}
+                            # else:
+                            raise ValueError("Arguments field in <toolcall> JSON is not a dictionary or recognized string format")
                     else:
-                         raise ValueError("Unexpected JSON structure in <toolcall>")
+                        raise ValueError("Unexpected JSON structure in <toolcall>")
+
+                    # Ensure tool_name was determined
+                    if not tool_name:
+                        raise ValueError("Could not determine tool name from <toolcall> tag")
+
 
                     print(f"--- Calling tool (from tag): {tool_name} with args: {tool_args} ---")
                     # Pass the extracted dictionary directly
@@ -174,7 +207,7 @@ class Chat:
                 self.messages.append(final_assistant_message)
                 if final_assistant_message.get('content'):
                     print(f"\nAssistant: {final_assistant_message['content']}")
-            
+
             # If no tool call was attempted or parsed, print the original response content
             elif assistant_message.get('content'):
                  print(f"\nAssistant: {assistant_message['content']}")
@@ -187,7 +220,7 @@ class Chat:
     async def chat_loop(self, session: ClientSession):
         while True:
             query = input("\nQuery: ").strip()
-            
+
             # Check for exit commands
             if query.lower() in ["quit", "stop", "exit"]:
                 print("Exiting chat...")
