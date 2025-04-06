@@ -1,6 +1,6 @@
 # AI SQL Assistant
 
-A natural language interface for interacting with SQLite databases, powered by Anthropic's Claude AI.
+A natural language interface for interacting with SQLite databases, powered by Ollama.
 
 ## Overview
 
@@ -25,25 +25,31 @@ The application consists of three main components:
 
 ## Prerequisites
 
-- Python 3.8+
-- An Anthropic API key (to access Claude)
-
+- Python 3.11+
+- [uv](https://github.com/astral-sh/uv) (Python package installer and resolver)
+- [Ollama](https://ollama.com/) installed and running locally.
 ## Installation
 
 1. Clone this repository:
    ```
-   git clone https://github.com/yourusername/ai-sql-assistant.git
+   git clone https://github.com/onedeveloper/innovathon-mcp-poc.git
    cd ai-sql-assistant
    ```
 
-2. Install dependencies:
-   ```
-   pip install -r requirements.txt
+2. Install dependencies using uv:
+   ```bash
+   uv sync
    ```
 
-3. Create a `.env` file in the project root with your Anthropic API key:
+3. **(Optional)** Create a `.env` file in the project root to specify the Ollama model:
    ```
-   ANTHROPIC_API_KEY=your_api_key_here
+   OLLAMA_MODEL_NAME=your_ollama_model_name # e.g., llama3.2:1b
+   ```
+   If not set, the application defaults to `llama3.2:1b`.
+
+4. Ensure the Ollama model you intend to use is available locally. You can pull it using:
+   ```bash
+   ollama pull <model_name> # e.g., ollama pull llama3.2:1b
    ```
 
 ## Usage
@@ -55,7 +61,7 @@ The application consists of three main components:
 
 2. Open your web browser and navigate to:
    ```
-   http://localhost:7860
+   http://127.0.0.1:7860
    ```
 
 3. Type in a natural language query and press Enter or click Submit.
@@ -89,16 +95,16 @@ The application creates a sample SQLite database with the following tables:
 
 ## Technical Details
 
-### MCP (Model Completion Protocol)
+### MCP (Model Context Protocol)
 
-The application uses MCP to manage communication between Claude and the SQLite database. MCP allows Claude to call functions (tools) and receive results, creating an interactive feedback loop.
+The application uses MCP to manage communication between the AI model and the SQLite database tools. MCP allows the model to call functions (tools) provided by the `mcp_server.py` (like `query_data`, `get_database_schema`, `list_tables`) and receive results, enabling it to interact with the database.
 
-### Anthropic Claude
+### Ollama
 
-The application uses Anthropic's Claude 3.7 Sonnet model to:
-1. Understand natural language queries
-2. Generate appropriate SQL queries
-3. Explain query results to users
+The application uses a local Ollama model (defaulting to `llama3.2:1b`, configurable via the `OLLAMA_MODEL_NAME` environment variable) to:
+1. Understand natural language queries.
+2. Decide which MCP tool to call (`query_data`, `get_database_schema`, or `list_tables`).
+3. Format the results from the tools for the user.
 
 ### SQLite
 
@@ -119,7 +125,7 @@ To use your own SQLite database instead of the sample one:
 
 ### Modifying the System Prompt
 
-The system prompt that guides Claude's behavior can be modified in the `ChatProcessor` class in `app.py`.
+The system prompt that guides the AI model's behavior can be modified in the `ChatProcessor` class in `app.py`.
 
 ## Limitations
 
