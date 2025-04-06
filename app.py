@@ -1,38 +1,51 @@
-import asyncio
-import threading
-import queue
 import os
 import time
 import sqlite3
-from typing import Union, cast, Optional, List, Dict, Any
+from typing import List, Dict, Any # Removed unused imports
 
 import gradio as gr
-import anthropic
-from anthropic.types import MessageParam, TextBlock, ToolUnionParam, ToolUseBlock
+import ollama # Added ollama
 from dotenv import load_dotenv
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
 from rich.console import Console
 from rich.markdown import Markdown
 
 # Load environment variables
 load_dotenv()
 
-# Initialize Anthropic client
-anthropic_client = anthropic.AsyncAnthropic()
-
-# Create a console for rich text formatting
+# Create a console for rich text formatting (kept for potential future use)
 console = Console()
 
-# Create server parameters for stdio connection
-server_params = StdioServerParameters(
-    command="python",  # Executable
-    args=["./mcp_server.py"],  # Optional command line arguments
-    env=None,  # Optional environment variables
-)
+# Helper function to get schema
+def get_db_schema(db_path="database.db"):
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+    tables = cursor.fetchall()
+    schema_str = "Database Schema:\n"
+    for table_name in tables:
+        table_name = table_name[0]
+        schema_str += f"\nTable: {table_name}\nColumns:\n"
+        cursor.execute(f"PRAGMA table_info({table_name});")
+        columns = cursor.fetchall()
+        for col in columns:
+            # cid, name, type, notnull, dflt_value, pk
+            schema_str += f"- {col[1]} ({col[2]}){' PRIMARY KEY' if col[5] else ''}{' NOT NULL' if col[3] else ''}\n"
+    conn.close()
+    return schema_str
 
-# Global message queue for async communication
-message_queue = queue.Queue()
+# Helper function to format results
+def format_results_as_markdown(cursor, rows):
+    if not cursor.description: # Handle cases like INSERT/UPDATE/DELETE
+        return ""
+    headers = [description[0] for description in cursor.description]
+    markdown_table = "| " + " | ".join(headers) + " |\n"
+    markdown_table += "| " + " | ".join(["---"] * len(headers)) + " |\n"
+    for row in rows:
+        markdown_table += "| " + " | ".join(map(str, row)) + " |\n"
+    return markdown_table
+
+# Global chat processor instance
+chat_processor = None
 
 # Check if database exists, if not create a sample one
 def initialize_database():
@@ -83,159 +96,107 @@ def initialize_database():
 
 class ChatProcessor:
     def __init__(self):
-        self.messages: list[MessageParam] = []
-        self.system_prompt: str = """You are a master SQLite assistant. 
-        Your job is to use the tools at your disposal to execute SQL queries and provide the results to the user.
-        
-        When you need to display table results, format them in a nice markdown table format.
-        When you need to execute a SQL query, use the query_data tool. 
-        Always explain the results of your query in a clear, easy-to-understand way.
-        If there's an error with a query, explain what went wrong and suggest a fix."""
-        
-        # Start the MCP server and processing thread
-        self.start_backend()
-    
-    def start_backend(self):
-        """Start the backend processing thread that handles MCP communication"""
-        threading.Thread(target=self._start_mcp_server, daemon=True).start()
-    
-    def _start_mcp_server(self):
-        """Initialize and run the MCP server connection"""
-        asyncio.run(self._run_server())
-    
-    async def _run_server(self):
-        """Run the MCP server and initialize the connection"""
-        async with stdio_client(server_params) as (read, write):
-            async with ClientSession(read, write) as session:
-                # Initialize the connection
-                await session.initialize()
-                
-                # Process messages from the queue
-                while True:
-                    try:
-                        # Check if there are any messages in the queue
-                        if not message_queue.empty():
-                            query, response_callback = message_queue.get()
-                            result = await self._process_query(session, query)
-                            response_callback(result)
-                    except Exception as e:
-                        print(f"Error processing message: {str(e)}")
-                        
-                    # Short sleep to prevent CPU hogging
-                    await asyncio.sleep(0.1)
-    
-    async def _process_query(self, session: ClientSession, query: str) -> List[str]:
-        """Process a query and return the response messages"""
-        response = await session.list_tools()
-        available_tools: list[ToolUnionParam] = [
-            {
-                "name": tool.name,
-                "description": tool.description or "",
-                "input_schema": tool.inputSchema,
-            }
-            for tool in response.tools
+        self.messages: list[Dict[str, str]] = [] # Simple list of dicts for history
+        self.db_schema = get_db_schema()
+        self.system_prompt: str = f"""You are an expert SQLite assistant.
+Your task is to translate the user's natural language query into a valid SQLite query based on the provided database schema.
+{self.db_schema}
+Instructions:
+1. Analyze the user's request and the database schema.
+2. Generate *only* the SQLite query that fulfills the user's request.
+3. Do not add any explanations, comments, or introductory text before or after the SQL query.
+4. Ensure the generated query is valid SQLite syntax.
+5. If the user asks for information not derivable from the schema (e.g., "What's the weather?"), respond with "I can only answer questions about the database."
+6. If the user's request is ambiguous or unclear, ask for clarification by responding with "Could you please clarify your request?".
+7. Output *only* the raw SQL query or one of the specific error messages mentioned above."""
+        # No backend server start needed
+
+    def _process_query(self, query: str) -> str:
+        """Process a query using Ollama, execute SQL, return the response message"""
+        # Add user query to history
+        self.messages.append({"role": "user", "content": query})
+
+        # Prepare messages for Ollama (include system prompt and history)
+        ollama_messages = [
+            {"role": "system", "content": self.system_prompt},
+            *self.messages # Send the whole history
         ]
-        
-        # Add the user message to the conversation
-        self.messages.append(
-            MessageParam(
-                role="user",
-                content=query,
+
+        try:
+            # Call Ollama
+            response = ollama.chat(
+                model='gemma3:27b', # Make sure this model is pulled in Ollama
+                messages=ollama_messages
             )
-        )
-        
-        # All Claude responses will be collected here
-        all_responses = []
+            generated_sql = response['message']['content'].strip()
 
-        # Initial Claude API call
-        res = await anthropic_client.messages.create(
-            model="claude-3-7-sonnet-latest",
-            system=self.system_prompt,
-            max_tokens=8000,
-            messages=self.messages,
-            tools=available_tools,
-        )
+            # Check for refusal messages from the prompt instructions
+            if generated_sql == "I can only answer questions about the database." or \
+               generated_sql == "Could you please clarify your request?":
+                 self.messages.append({"role": "assistant", "content": generated_sql})
+                 return generated_sql
 
-        assistant_message_content: list[Union[ToolUseBlock, TextBlock]] = []
-        for content in res.content:
-            if content.type == "text":
-                assistant_message_content.append(content)
-                all_responses.append(content.text)
-            elif content.type == "tool_use":
-                tool_name = content.name
-                tool_args = content.input
+            # Assume the response is SQL, try executing it
+            conn = sqlite3.connect("database.db")
+            cursor = conn.cursor()
+            try:
+                start_time = time.time()
+                cursor.execute(generated_sql)
+                execution_time = time.time() - start_time
 
-                # Execute tool call
-                result = await session.call_tool(tool_name, cast(dict, tool_args))
+                # Check if it was a SELECT query or a modification query
+                if generated_sql.strip().upper().startswith("SELECT"):
+                    rows = cursor.fetchall()
+                    if rows:
+                        # Format results
+                        result_str = format_results_as_markdown(cursor, rows)
+                        result_str += f"\n\n_(Query executed in {execution_time:.2f} seconds)_"
+                    else:
+                        result_str = f"Query executed successfully, but returned no results.\n\n_(Query executed in {execution_time:.2f} seconds)_"
+                else:
+                    conn.commit() # Commit changes for INSERT, UPDATE, DELETE
+                    result_str = f"Query executed successfully. {cursor.rowcount} row(s) affected.\n\n_(Query executed in {execution_time:.2f} seconds)_"
 
-                assistant_message_content.append(content)
-                self.messages.append(
-                    {"role": "assistant", "content": assistant_message_content}
-                )
-                self.messages.append(
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": content.id,
-                                "content": getattr(result.content[0], "text", ""),
-                            }
-                        ],
-                    }
-                )
-                # Get next response from Claude
-                res = await anthropic_client.messages.create(
-                    model="claude-3-7-sonnet-latest",
-                    max_tokens=8000,
-                    messages=self.messages,
-                    tools=available_tools,
-                )
-                
-                response_text = getattr(res.content[0], "text", "")
-                self.messages.append(
-                    {
-                        "role": "assistant",
-                        "content": response_text,
-                    }
-                )
-                all_responses.append(response_text)
+                self.messages.append({"role": "assistant", "content": result_str}) # Add successful result to history
+                return result_str
 
-        return all_responses
+            except sqlite3.Error as e:
+                conn.rollback() # Rollback on error
+                error_message = f"SQLite Error: `{e}`\n\nAttempted Query:\n```sql\n{generated_sql}\n```"
+                self.messages.append({"role": "assistant", "content": error_message}) # Add error to history
+                return error_message
+            finally:
+                conn.close()
+
+        except Exception as e:
+            # Catch errors from Ollama call or other issues
+            error_message = f"An unexpected error occurred: {e}"
+            self.messages.append({"role": "assistant", "content": error_message})
+            return error_message
 
 def submit_query(query: str, chat_history: list) -> tuple[list, list]:
     """Submit a query to the chat processor and update the chat history"""
+    global chat_processor # Access the global instance
     if not query.strip():
         return chat_history, chat_history
-    
-    # Add user message to history immediately
+
+    # Add user message to history immediately for UI update
     chat_history.append((query, None))
-    
-    # Create a result container
-    result_container = []
-    
-    # Define callback for when the result is ready
-    def on_result(responses):
-        combined_response = "\n\n".join(responses)
-        result_container.append(combined_response)
-    
-    # Submit the query to the processor
-    message_queue.put((query, on_result))
-    
-    # Wait for the result
-    while not result_container:
-        time.sleep(0.1)
-    
-    # Update the last history entry with the response
-    chat_history[-1] = (query, result_container[0])
-    
+
+    # Process the query directly using the global instance
+    response_text = chat_processor._process_query(query) # This updates internal history
+
+    # Update the Gradio chat history with the response
+    chat_history[-1] = (query, response_text)
+
     return chat_history, chat_history
 
 def main():
     # Initialize the database with sample data if needed
     initialize_database()
     
-    # Initialize the chat processor
+    # Initialize the global chat processor instance
+    global chat_processor
     chat_processor = ChatProcessor()
     
     # Create the Gradio interface
