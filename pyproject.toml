@@ -5,10 +5,9 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "anthropic>=0.49.0",
     "docker>=7.1.0",
     "gradio>=4.19.2",
-    "instructor[claude]>=1.7.3",
+    "ollama>=0.2.1", # Added Ollama library
     "loguru>=0.7.3",
     "mcp[cli]>=1.3.0",
     "pydantic>=2.10.6",

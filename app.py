@@ -4,11 +4,12 @@ import queue
 import os
 import time
 import sqlite3
+import json
 from typing import Union, cast, Optional, List, Dict, Any
 
 import gradio as gr
-import anthropic
-from anthropic.types import MessageParam, TextBlock, ToolUnionParam, ToolUseBlock
+import ollama # Replaced anthropic with ollama
+# Removed Anthropic specific types
 from dotenv import load_dotenv
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -18,8 +19,9 @@ from rich.markdown import Markdown
 # Load environment variables
 load_dotenv()
 
-# Initialize Anthropic client
-anthropic_client = anthropic.AsyncAnthropic()
+# Initialize Ollama client
+# Assuming Ollama server is running locally at default address http://localhost:11434
+ollama_client = ollama.AsyncClient()
 
 # Create a console for rich text formatting
 console = Console()
@@ -83,14 +85,24 @@ def initialize_database():
 
 class ChatProcessor:
     def __init__(self):
-        self.messages: list[MessageParam] = []
-        self.system_prompt: str = """You are a master SQLite assistant. 
-        Your job is to use the tools at your disposal to execute SQL queries and provide the results to the user.
-        
-        When you need to display table results, format them in a nice markdown table format.
-        When you need to execute a SQL query, use the query_data tool. 
-        Always explain the results of your query in a clear, easy-to-understand way.
-        If there's an error with a query, explain what went wrong and suggest a fix."""
+        self.messages: list[Dict[str, Any]] = [] # Changed message format for Ollama
+        self.system_prompt: str = """You are a master SQLite assistant.
+        You have access to three tools:
+        - `query_data`: Execute general SQL queries. Requires a parameter 'sql' containing the SQL string.
+        - `get_database_schema`: Retrieve the CREATE TABLE statements for all tables. Takes no parameters.
+        - `list_tables`: List the names of all tables in the database. Takes no parameters.
+
+        **IMPORTANT INSTRUCTIONS:**
+        1.  **To list tables:** Use the `list_tables` tool.
+        2.  **To understand table structure (columns/types):** Use the `get_database_schema` tool.
+        3.  **For queries requiring column knowledge** (e.g., SELECT *, INSERT, UPDATE, WHERE on specific columns, ORDER BY specific columns):
+            a. **First, call `get_database_schema`** (unless you have *just* retrieved it in the immediately preceding turn).
+            b. **Then, use the schema** to construct an accurate SQL query for the `query_data` tool. Only use columns present in the schema.
+        4.  **For simple SELECT queries on known columns** (if schema was recently retrieved) or general queries not needing specific column names: Use the `query_data` tool directly.
+        5.  When displaying query results, format them in a nice markdown table if appropriate.
+        6.  Always explain the results of your query, the schema, or the table list clearly.
+        7.  If a `query_data` call fails, explain the error using the schema information (if available) and suggest a valid query or the use of `get_database_schema`.
+        """
         
         # Start the MCP server and processing thread
         self.start_backend()
@@ -125,81 +137,149 @@ class ChatProcessor:
                     await asyncio.sleep(0.1)
     
     async def _process_query(self, session: ClientSession, query: str) -> List[str]:
-        """Process a query and return the response messages"""
-        response = await session.list_tools()
-        available_tools: list[ToolUnionParam] = [
+        """Process a query using Ollama and return the response messages"""
+        # Get available tools from MCP server
+        mcp_response = await session.list_tools()
+        # Format tools for Ollama API
+        available_tools = [
             {
-                "name": tool.name,
-                "description": tool.description or "",
-                "input_schema": tool.inputSchema,
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description or "",
+                    "parameters": tool.inputSchema,
+                },
             }
-            for tool in response.tools
+            for tool in mcp_response.tools
         ]
-        
+
+        # Add system prompt if messages list is empty
+        if not self.messages:
+             self.messages.append({"role": "system", "content": self.system_prompt})
+
         # Add the user message to the conversation
-        self.messages.append(
-            MessageParam(
-                role="user",
-                content=query,
-            )
-        )
-        
-        # All Claude responses will be collected here
+        self.messages.append({"role": "user", "content": query})
+
+        # All Ollama responses will be collected here
         all_responses = []
+        
+        # Specify the Ollama model to use (e.g., llama3, change if needed)
+        # Read model name from environment variable, default if not set
+        model_name = os.getenv("OLLAMA_MODEL_NAME", "llama3.2:1b") # Updated default model
 
-        # Initial Claude API call
-        res = await anthropic_client.messages.create(
-            model="claude-3-7-sonnet-latest",
-            system=self.system_prompt,
-            max_tokens=8000,
-            messages=self.messages,
-            tools=available_tools,
-        )
+        try:
+            # Initial Ollama API call
+            response = await ollama_client.chat(
+                model=model_name,
+                messages=self.messages,
+                tools=available_tools,
+                stream=False, # Keep stream=False for simpler tool handling initially
+            )
 
-        assistant_message_content: list[Union[ToolUseBlock, TextBlock]] = []
-        for content in res.content:
-            if content.type == "text":
-                assistant_message_content.append(content)
-                all_responses.append(content.text)
-            elif content.type == "tool_use":
-                tool_name = content.name
-                tool_args = content.input
+            assistant_message = response['message']
+            self.messages.append(assistant_message) # Add assistant's response (could be text or tool_calls)
 
-                # Execute tool call
-                result = await session.call_tool(tool_name, cast(dict, tool_args))
+            # --- Tool Call Handling ---
+            tool_executed = False
+            final_content_to_return = None
 
-                assistant_message_content.append(content)
-                self.messages.append(
-                    {"role": "assistant", "content": assistant_message_content}
-                )
-                self.messages.append(
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": content.id,
-                                "content": getattr(result.content[0], "text", ""),
-                            }
-                        ],
-                    }
-                )
-                # Get next response from Claude
-                res = await anthropic_client.messages.create(
-                    model="claude-3-7-sonnet-latest",
-                    max_tokens=8000,
+            # Option 1: Check structured tool_calls field (Standard way)
+            if assistant_message.get('tool_calls'):
+                print("--- Handling structured tool_calls ---")
+                tool_executed = True
+                for tool_call in assistant_message['tool_calls']:
+                    tool_name = tool_call['function']['name']
+                    try:
+                        tool_args = json.loads(tool_call['function']['arguments'])
+                    except json.JSONDecodeError:
+                        tool_args = tool_call['function']['arguments']
+                    
+                    print(f"Calling tool: {tool_name} with args: {tool_args}")
+                    mcp_tool_result = await session.call_tool(tool_name, cast(dict, tool_args))
+                    tool_result_content = getattr(mcp_tool_result.content[0], "text", "")
+                    print(f"Tool result: {tool_result_content}")
+
+                    # Append tool result with more context for the model
+                    formatted_tool_result = f"Tool execution result for {tool_name}: {tool_result_content}"
+                    self.messages.append({
+                        "role": "tool",
+                        "content": formatted_tool_result, # Use the formatted string
+                        # "tool_call_id": tool_call.get('id')
+                    })
+
+            # Option 2: Check for <toolcall> tag in content (Workaround)
+            elif assistant_message.get('content') and '<toolcall>' in assistant_message['content']:
+                print("--- Handling <toolcall> tag in content ---")
+                tool_executed = True
+                content_str = assistant_message['content']
+                try:
+                    start_tag = '<toolcall>'
+                    end_tag = '</toolcall>'
+                    start_index = content_str.find(start_tag) + len(start_tag)
+                    end_index = content_str.find(end_tag)
+                    tool_call_json_str = content_str[start_index:end_index].strip()
+                    tool_call_data = json.loads(tool_call_json_str)
+                    
+                    # Extract tool name and args
+                    if tool_call_data.get("type") == "function" and "arguments" in tool_call_data:
+                        # Assume the tool is 'query_data' based on context
+                        tool_name = "query_data"
+                        # The 'arguments' field itself should be the dictionary of args
+                        tool_args = tool_call_data["arguments"]
+                        if not isinstance(tool_args, dict):
+                            # Ensure tool_args is actually a dictionary
+                            raise ValueError("Arguments field in <toolcall> JSON is not a dictionary")
+                    else:
+                         raise ValueError("Unexpected JSON structure in <toolcall>")
+
+                    print(f"--- Calling tool (from tag): {tool_name} with args: {tool_args} ---")
+                    # Pass the extracted dictionary directly
+                    mcp_tool_result = await session.call_tool(tool_name, cast(dict, tool_args))
+                    tool_result_content = getattr(mcp_tool_result.content[0], "text", "")
+                    print(f"Tool result: {tool_result_content}")
+
+                    # Append tool result with more context for the model (for tag parsing path)
+                    formatted_tool_result = f"Tool execution result for {tool_name}: {tool_result_content}"
+                    self.messages.append({
+                        "role": "tool",
+                        "content": formatted_tool_result, # Use the formatted string
+                    })
+                except Exception as parse_error:
+                    print(f"--- Error parsing <toolcall> tag: {parse_error} ---")
+                    tool_executed = False # Reset flag as tool call failed
+                    final_content_to_return = f"Error parsing tool call: {parse_error}" # Provide error feedback
+
+            # --- Follow-up Call or Final Response ---
+            if tool_executed:
+                print("--- Making follow-up call to Ollama with tool results ---")
+                final_response = await ollama_client.chat(
+                    model=model_name,
                     messages=self.messages,
-                    tools=available_tools,
+                    stream=False,
                 )
-                
-                response_text = getattr(res.content[0], "text", "")
-                self.messages.append(
-                    {
-                        "role": "assistant",
-                        "content": response_text,
-                    }
-                )
-                all_responses.append(response_text)
+                final_assistant_message = final_response['message']
+                self.messages.append(final_assistant_message)
+                if final_assistant_message.get('content'):
+                    final_content_to_return = final_assistant_message['content']
+            
+            # If no tool call was attempted/parsed, use the original response content
+            elif assistant_message.get('content'):
+                 final_content_to_return = assistant_message['content']
+
+            # Append the final content (either from follow-up or original response)
+            if final_content_to_return:
+                 all_responses.append(final_content_to_return)
+
+        except Exception as e:
+            print(f"Error during Ollama interaction: {e}")
+            all_responses.append(f"Sorry, an error occurred: {e}")
+            # Optionally remove the last user message and assistant attempt from history on error
+            # self.messages = self.messages[:-2] # Or more sophisticated error handling
+
+        # Limit message history length (optional)
+        # max_history = 10
+        # if len(self.messages) > max_history:
+        #     self.messages = self.messages[-max_history:]
 
         return all_responses
 
